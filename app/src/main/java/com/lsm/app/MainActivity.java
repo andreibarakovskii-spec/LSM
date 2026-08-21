@@ -8,14 +8,12 @@ import android.net.Network;
 import android.net.NetworkCapabilities;
 import android.os.Bundle;
 import android.view.Gravity;
-import android.view.View;
 import android.widget.Button;
 import android.widget.EditText;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
 
-import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
@@ -23,18 +21,52 @@ import java.util.UUID;
 public class MainActivity extends Activity {
     private static final int GREEN = Color.rgb(67, 160, 71);
     private static final int BG = Color.rgb(244, 247, 242);
+
     private final List<String> queue = new ArrayList<>();
     private LinearLayout messages;
     private TextView networkState;
     private TextView queueState;
     private EditText input;
+    private ConnectivityManager connectivityManager;
+
+    private final ConnectivityManager.NetworkCallback networkCallback = new ConnectivityManager.NetworkCallback() {
+        @Override
+        public void onAvailable(Network network) {
+            runOnUiThread(() -> refreshNetwork());
+        }
+
+        @Override
+        public void onLost(Network network) {
+            runOnUiThread(() -> refreshNetwork());
+        }
+
+        @Override
+        public void onCapabilitiesChanged(Network network, NetworkCapabilities caps) {
+            runOnUiThread(() -> refreshNetwork());
+        }
+    };
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        connectivityManager = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
         restoreQueue();
         buildUi();
         refreshNetwork();
+        try {
+            connectivityManager.registerDefaultNetworkCallback(networkCallback);
+        } catch (RuntimeException ignored) {
+            // App still works with polling on send if callback registration is unavailable.
+        }
+    }
+
+    @Override
+    protected void onDestroy() {
+        try {
+            connectivityManager.unregisterNetworkCallback(networkCallback);
+        } catch (RuntimeException ignored) {
+        }
+        super.onDestroy();
     }
 
     private void buildUi() {
@@ -65,7 +97,7 @@ public class MainActivity extends Activity {
         root.addView(diagnostics);
 
         TextView contact = new TextView(this);
-        contact.setText("●  Тестовый контакт\n     защищённый чат");
+        contact.setText("●  Тестовый контакт\n     локальная защита включена");
         contact.setTextSize(16);
         contact.setTextColor(Color.DKGRAY);
         contact.setPadding(dp(12), dp(10), dp(12), dp(10));
@@ -77,9 +109,8 @@ public class MainActivity extends Activity {
         messages.setOrientation(LinearLayout.VERTICAL);
         messages.setPadding(0, dp(10), 0, dp(10));
         scroll.addView(messages);
-        LinearLayout.LayoutParams scrollParams = new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, 0, 1);
-        root.addView(scroll, scrollParams);
+        root.addView(scroll, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, 0, 1));
 
         renderHistory();
 
@@ -101,7 +132,7 @@ public class MainActivity extends Activity {
         root.addView(composer);
 
         TextView footer = new TextView(this);
-        footer.setText("Текст отправляется первым • очередь переживает обрыв связи");
+        footer.setText("Текст первым • очередь переживает обрыв • данные очереди зашифрованы");
         footer.setTextSize(11);
         footer.setTextColor(Color.GRAY);
         footer.setGravity(Gravity.CENTER);
@@ -114,20 +145,21 @@ public class MainActivity extends Activity {
     private void sendMessage() {
         String text = input.getText().toString().trim();
         if (text.isEmpty()) return;
+
         String id = UUID.randomUUID().toString();
         String item = id + "|" + System.currentTimeMillis() + "|" + text.replace("\n", " ");
         queue.add(item);
         saveQueue();
         addBubble(text, isOnline() ? "в очереди → доставка" : "нет сети → сохранено локально");
         input.setText("");
-        if (isOnline()) flushQueue();
         refreshNetwork();
     }
 
     private void flushQueue() {
         if (!isOnline() || queue.isEmpty()) return;
-        // MVP: transport relay is plugged in here. For now messages are acknowledged locally
-        // so the APK can exercise queue persistence and weak-network behavior without a server.
+
+        // MVP transport boundary. A real store-and-forward relay with authenticated ACKs
+        // will replace this local acknowledgement without changing the UI/outbox contract.
         queue.clear();
         saveQueue();
         queueState.setText("Очередь: 0");
@@ -140,6 +172,7 @@ public class MainActivity extends Activity {
         bubble.setTextColor(Color.rgb(25, 55, 25));
         bubble.setPadding(dp(12), dp(9), dp(12), dp(9));
         bubble.setBackgroundColor(Color.rgb(224, 242, 224));
+
         LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.WRAP_CONTENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT);
@@ -150,10 +183,11 @@ public class MainActivity extends Activity {
 
     private void renderHistory() {
         TextView hint = new TextView(this);
-        hint.setText("LSM готов. Отключите интернет и отправьте сообщение — оно останется в локальной очереди.");
+        hint.setText("LSM готов. Отключите интернет и отправьте сообщение — оно останется в зашифрованной локальной очереди.");
         hint.setTextColor(Color.GRAY);
         hint.setPadding(dp(8), dp(8), dp(8), dp(8));
         messages.addView(hint);
+
         for (String item : queue) {
             String[] parts = item.split("\\|", 3);
             if (parts.length == 3) addBubble(parts[2], "ожидает сети");
@@ -169,22 +203,40 @@ public class MainActivity extends Activity {
     }
 
     private boolean isOnline() {
-        ConnectivityManager cm = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
-        Network network = cm.getActiveNetwork();
+        Network network = connectivityManager.getActiveNetwork();
         if (network == null) return false;
-        NetworkCapabilities caps = cm.getNetworkCapabilities(network);
+        NetworkCapabilities caps = connectivityManager.getNetworkCapabilities(network);
         return caps != null && caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET);
     }
 
     private void saveQueue() {
         String joined = String.join("\n", queue);
-        getSharedPreferences("lsm", MODE_PRIVATE).edit().putString("outbox", joined).apply();
+        try {
+            String encrypted = LocalVault.encrypt(joined);
+            getSharedPreferences("lsm", MODE_PRIVATE)
+                    .edit()
+                    .putString("outbox_encrypted", encrypted)
+                    .remove("outbox")
+                    .apply();
+        } catch (Exception e) {
+            // Fail closed: never fall back to plaintext storage.
+        }
     }
 
     private void restoreQueue() {
-        String stored = getSharedPreferences("lsm", MODE_PRIVATE).getString("outbox", "");
-        if (!stored.isEmpty()) {
-            for (String line : stored.split("\n")) if (!line.isBlank()) queue.add(line);
+        String encrypted = getSharedPreferences("lsm", MODE_PRIVATE)
+                .getString("outbox_encrypted", "");
+        if (encrypted.isEmpty()) return;
+
+        try {
+            String stored = LocalVault.decrypt(encrypted);
+            if (!stored.isEmpty()) {
+                for (String line : stored.split("\n")) {
+                    if (!line.trim().isEmpty()) queue.add(line);
+                }
+            }
+        } catch (Exception ignored) {
+            // Corrupt or undecryptable queue is not exposed as plaintext.
         }
     }
 
