@@ -56,7 +56,6 @@ public class MainActivity extends Activity {
         try {
             connectivityManager.registerDefaultNetworkCallback(networkCallback);
         } catch (RuntimeException ignored) {
-            // App still works with polling on send if callback registration is unavailable.
         }
     }
 
@@ -97,7 +96,7 @@ public class MainActivity extends Activity {
         root.addView(diagnostics);
 
         TextView contact = new TextView(this);
-        contact.setText("●  Тестовый контакт\n     локальная защита включена");
+        contact.setText("●  Тестовый контакт\n     store-and-forward test");
         contact.setTextSize(16);
         contact.setTextColor(Color.DKGRAY);
         contact.setPadding(dp(12), dp(10), dp(12), dp(10));
@@ -132,7 +131,7 @@ public class MainActivity extends Activity {
         root.addView(composer);
 
         TextView footer = new TextView(this);
-        footer.setText("Текст первым • очередь переживает обрыв • данные очереди зашифрованы");
+        footer.setText("Сообщение остаётся в очереди до подтверждения relay ACK");
         footer.setTextSize(11);
         footer.setTextColor(Color.GRAY);
         footer.setGravity(Gravity.CENTER);
@@ -150,7 +149,7 @@ public class MainActivity extends Activity {
         String item = id + "|" + System.currentTimeMillis() + "|" + text.replace("\n", " ");
         queue.add(item);
         saveQueue();
-        addBubble(text, isOnline() ? "в очереди → доставка" : "нет сети → сохранено локально");
+        addBubble(text, isOnline() ? "сеть есть → ожидает relay ACK" : "нет сети → сохранено локально");
         input.setText("");
         refreshNetwork();
     }
@@ -158,11 +157,10 @@ public class MainActivity extends Activity {
     private void flushQueue() {
         if (!isOnline() || queue.isEmpty()) return;
 
-        // MVP transport boundary. A real store-and-forward relay with authenticated ACKs
-        // will replace this local acknowledgement without changing the UI/outbox contract.
-        queue.clear();
-        saveQueue();
-        queueState.setText("Очередь: 0");
+        // Store-and-forward rule: NEVER clear the local outbox merely because a network
+        // is available. The transport layer may remove an item only after the relay has
+        // accepted the opaque encrypted envelope and returned an authenticated ACK.
+        queueState.setText("Очередь: " + queue.size() + " • ждём ACK");
     }
 
     private void addBubble(String text, String status) {
@@ -183,14 +181,14 @@ public class MainActivity extends Activity {
 
     private void renderHistory() {
         TextView hint = new TextView(this);
-        hint.setText("LSM готов. Отключите интернет и отправьте сообщение — оно останется в зашифрованной локальной очереди.");
+        hint.setText("Тест: сообщение не удаляется с телефона до подтверждения relay. Получатель может быть офлайн.");
         hint.setTextColor(Color.GRAY);
         hint.setPadding(dp(8), dp(8), dp(8), dp(8));
         messages.addView(hint);
 
         for (String item : queue) {
             String[] parts = item.split("\\|", 3);
-            if (parts.length == 3) addBubble(parts[2], "ожидает сети");
+            if (parts.length == 3) addBubble(parts[2], "ожидает доставки/ACK");
         }
     }
 
@@ -236,7 +234,6 @@ public class MainActivity extends Activity {
                 }
             }
         } catch (Exception ignored) {
-            // Corrupt or undecryptable queue is not exposed as plaintext.
         }
     }
 
