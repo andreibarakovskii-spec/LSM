@@ -8,7 +8,6 @@ from urllib.parse import parse_qs, urlparse
 MAX_BODY = 64 * 1024
 DEFAULT_TTL_SECONDS = 7 * 24 * 60 * 60
 
-
 class MessageStore:
     def __init__(self, db_path="relay.db"):
         self.db_path = db_path
@@ -21,18 +20,28 @@ class MessageStore:
 
     def _init_db(self):
         with self._connect() as con:
-            con.execute(
-                """
+            con.execute("""
                 CREATE TABLE IF NOT EXISTS messages (
                     id TEXT PRIMARY KEY,
+                    sender TEXT NOT NULL DEFAULT '',
                     recipient TEXT NOT NULL,
                     ciphertext TEXT NOT NULL,
                     created_at INTEGER NOT NULL,
                     expires_at INTEGER NOT NULL
                 )
-                """
-            )
+            """)
+            cols = {r[1] for r in con.execute("PRAGMA table_info(messages)")}
+            if "sender" not in cols:
+                con.execute("ALTER TABLE messages ADD COLUMN sender TEXT NOT NULL DEFAULT ''")
             con.execute("CREATE INDEX IF NOT EXISTS idx_messages_recipient ON messages(recipient, created_at)")
+            con.execute("""
+                CREATE TABLE IF NOT EXISTS receipts (
+                    id TEXT NOT NULL,
+                    sender TEXT NOT NULL,
+                    acked_at INTEGER NOT NULL,
+                    PRIMARY KEY(id, sender)
+                )
+            """)
 
     def purge_expired(self, now=None):
         now = int(now or time.time())
@@ -40,14 +49,14 @@ class MessageStore:
             cur = con.execute("DELETE FROM messages WHERE expires_at <= ?", (now,))
             return cur.rowcount
 
-    def enqueue(self, message_id, recipient, ciphertext, ttl_seconds=DEFAULT_TTL_SECONDS, now=None):
+    def enqueue(self, message_id, sender, recipient, ciphertext, ttl_seconds=DEFAULT_TTL_SECONDS, now=None):
         now = int(now or time.time())
         expires_at = now + max(60, min(int(ttl_seconds), DEFAULT_TTL_SECONDS))
         self.purge_expired(now)
         with self._connect() as con:
             con.execute(
-                "INSERT OR IGNORE INTO messages(id, recipient, ciphertext, created_at, expires_at) VALUES(?,?,?,?,?)",
-                (message_id, recipient, ciphertext, now, expires_at),
+                "INSERT OR IGNORE INTO messages(id,sender,recipient,ciphertext,created_at,expires_at) VALUES(?,?,?,?,?,?)",
+                (message_id, sender, recipient, ciphertext, now, expires_at),
             )
         return expires_at
 
@@ -57,14 +66,32 @@ class MessageStore:
         limit = max(1, min(int(limit), 100))
         with self._connect() as con:
             rows = con.execute(
-                "SELECT id, ciphertext, created_at, expires_at FROM messages WHERE recipient=? ORDER BY created_at ASC LIMIT ?",
+                "SELECT id,sender,ciphertext,created_at,expires_at FROM messages WHERE recipient=? ORDER BY created_at ASC LIMIT ?",
                 (recipient, limit),
             ).fetchall()
-        return [dict(row) for row in rows]
+        return [dict(r) for r in rows]
 
-    def ack(self, recipient, message_id):
+    def ack(self, recipient, message_id, now=None):
+        now = int(now or time.time())
         with self._connect() as con:
-            cur = con.execute("DELETE FROM messages WHERE recipient=? AND id=?", (recipient, message_id))
+            row = con.execute("SELECT sender FROM messages WHERE recipient=? AND id=?", (recipient, message_id)).fetchone()
+            if not row:
+                return False
+            sender = row["sender"]
+            con.execute("DELETE FROM messages WHERE recipient=? AND id=?", (recipient, message_id))
+            if sender:
+                con.execute("INSERT OR REPLACE INTO receipts(id,sender,acked_at) VALUES(?,?,?)", (message_id, sender, now))
+            return True
+
+    def receipts(self, sender, limit=100):
+        limit = max(1, min(int(limit), 100))
+        with self._connect() as con:
+            rows = con.execute("SELECT id,acked_at FROM receipts WHERE sender=? ORDER BY acked_at ASC LIMIT ?", (sender, limit)).fetchall()
+        return [dict(r) for r in rows]
+
+    def receipt_ack(self, sender, message_id):
+        with self._connect() as con:
+            cur = con.execute("DELETE FROM receipts WHERE sender=? AND id=?", (sender, message_id))
             return cur.rowcount == 1
 
     def count(self):
@@ -74,14 +101,11 @@ class MessageStore:
 
 def make_handler(store):
     class Handler(BaseHTTPRequestHandler):
-        server_version = "LSMRelay/0.1"
-
-        def log_message(self, fmt, *args):
-            # Never log request bodies/ciphertext.
-            return
+        server_version = "LSMRelay/0.2"
+        def log_message(self, fmt, *args): return
 
         def _json(self, status, payload):
-            raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+            raw = json.dumps(payload, separators=(",", ":")).encode()
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(raw)))
@@ -91,63 +115,52 @@ def make_handler(store):
 
         def _read_json(self):
             length = int(self.headers.get("Content-Length", "0"))
-            if length <= 0 or length > MAX_BODY:
-                raise ValueError("invalid body size")
-            return json.loads(self.rfile.read(length).decode("utf-8"))
+            if length <= 0 or length > MAX_BODY: raise ValueError("invalid body size")
+            return json.loads(self.rfile.read(length).decode())
 
         def do_POST(self):
             try:
                 body = self._read_json()
                 if self.path == "/v1/messages":
-                    message_id = str(body["id"])
-                    recipient = str(body["to"])
+                    mid, sender, recipient = str(body["id"]), str(body["from"]), str(body["to"])
                     ciphertext = str(body["ciphertext"])
                     ttl = int(body.get("ttl_seconds", DEFAULT_TTL_SECONDS))
-                    if not message_id or not recipient or not ciphertext:
-                        raise ValueError("missing field")
-                    expires_at = store.enqueue(message_id, recipient, ciphertext, ttl)
-                    self._json(202, {"accepted": True, "id": message_id, "expires_at": expires_at})
-                    return
+                    if not mid or not sender or not recipient or not ciphertext: raise ValueError()
+                    exp = store.enqueue(mid, sender, recipient, ciphertext, ttl)
+                    return self._json(202, {"accepted": True, "id": mid, "expires_at": exp})
                 if self.path == "/v1/ack":
-                    recipient = str(body["recipient"])
-                    message_id = str(body["id"])
-                    removed = store.ack(recipient, message_id)
-                    self._json(200, {"acked": removed, "id": message_id})
-                    return
-                self._json(404, {"error": "not_found"})
+                    removed = store.ack(str(body["recipient"]), str(body["id"]))
+                    return self._json(200, {"acked": removed, "id": str(body["id"])})
+                if self.path == "/v1/receipt-ack":
+                    removed = store.receipt_ack(str(body["sender"]), str(body["id"]))
+                    return self._json(200, {"removed": removed, "id": str(body["id"])})
+                self._json(404, {"error":"not_found"})
             except (ValueError, KeyError, json.JSONDecodeError):
-                self._json(400, {"error": "bad_request"})
+                self._json(400, {"error":"bad_request"})
 
         def do_GET(self):
-            parsed = urlparse(self.path)
-            if parsed.path == "/health":
-                self._json(200, {"ok": True})
-                return
-            if parsed.path != "/v1/messages":
-                self._json(404, {"error": "not_found"})
-                return
-            qs = parse_qs(parsed.query)
-            recipient = (qs.get("recipient") or [""])[0]
-            if not recipient:
-                self._json(400, {"error": "recipient_required"})
-                return
-            items = store.pending(recipient)
-            self._json(200, {"messages": items})
-
+            p = urlparse(self.path)
+            if p.path == "/health": return self._json(200, {"ok":True})
+            qs = parse_qs(p.query)
+            if p.path == "/v1/messages":
+                recipient = (qs.get("recipient") or [""])[0]
+                if not recipient: return self._json(400, {"error":"recipient_required"})
+                return self._json(200, {"messages": store.pending(recipient)})
+            if p.path == "/v1/receipts":
+                sender = (qs.get("sender") or [""])[0]
+                if not sender: return self._json(400, {"error":"sender_required"})
+                return self._json(200, {"receipts": store.receipts(sender)})
+            self._json(404, {"error":"not_found"})
     return Handler
 
 
 def main():
     import argparse
-    parser = argparse.ArgumentParser(description="LSM opaque store-and-forward relay")
-    parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=8787)
-    parser.add_argument("--db", default="relay.db")
-    args = parser.parse_args()
-    store = MessageStore(args.db)
-    server = ThreadingHTTPServer((args.host, args.port), make_handler(store))
-    server.serve_forever()
+    p = argparse.ArgumentParser(description="LSM opaque store-and-forward relay")
+    p.add_argument("--host", default="0.0.0.0")
+    p.add_argument("--port", type=int, default=8787)
+    p.add_argument("--db", default="relay.db")
+    a = p.parse_args()
+    ThreadingHTTPServer((a.host, a.port), make_handler(MessageStore(a.db))).serve_forever()
 
-
-if __name__ == "__main__":
-    main()
+if __name__ == "__main__": main()
